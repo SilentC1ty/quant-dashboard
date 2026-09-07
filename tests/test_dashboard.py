@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from quant_dashboard.loader import load_strategy
 from quant_dashboard.metrics import strategy_metrics
 from quant_dashboard.sources import SourceRegistry, discover_strategy_dirs
@@ -65,9 +67,9 @@ def test_discover_project_and_load_metadata(tmp_path: Path) -> None:
     assert strategy.names["510300"] == "沪深300ETF"
 
     metrics = strategy_metrics(strategy)
-    assert metrics["total_return"] == 0.05
+    assert metrics["total_return"] == pytest.approx(0.05)
     assert metrics["trades"] == 1
-    assert metrics["total_cost"] == 20.0
+    assert metrics["total_cost"] == pytest.approx(20.0)
 
 
 def test_recursive_discovery_and_registry(tmp_path: Path) -> None:
