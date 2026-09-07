@@ -87,30 +87,36 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
         col1, col2, _ = st.columns([1, 1, 3])
 
         if col1.button("添加", type="primary", use_container_width=True):
-            try:
-                found = discover_strategy_dirs(source_path, recursive=False)
-                if not found:
-                    st.warning("没有找到兼容的 paper 数据目录。需要至少存在 state.json 和 nav.csv。")
-                else:
-                    added = registry.add(found, label=custom_label)
-                    st.success(f"发现 {len(found)} 份数据，新增 {added} 份。")
-                    st.cache_data.clear()
-                    st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+            if not source_path.strip():
+                st.warning("请输入目录路径。")
+            else:
+                try:
+                    found = discover_strategy_dirs(source_path, recursive=False)
+                    if not found:
+                        st.warning("没有找到兼容的 paper 数据目录。需要至少存在 state.json 和 nav.csv。")
+                    else:
+                        added = registry.add(found, label=custom_label)
+                        st.success(f"发现 {len(found)} 份数据，新增 {added} 份。")
+                        st.cache_data.clear()
+                        st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
 
         if col2.button("递归扫描", use_container_width=True):
-            try:
-                found = discover_strategy_dirs(source_path, recursive=True)
-                if not found:
-                    st.warning("该目录下没有找到兼容的 paper 数据。")
-                else:
-                    added = registry.add(found)
-                    st.success(f"扫描到 {len(found)} 份数据，新增 {added} 份。")
-                    st.cache_data.clear()
-                    st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+            if not source_path.strip():
+                st.warning("请输入目录路径。")
+            else:
+                try:
+                    found = discover_strategy_dirs(source_path, recursive=True)
+                    if not found:
+                        st.warning("该目录下没有找到兼容的 paper 数据。")
+                    else:
+                        added = registry.add(found)
+                        st.success(f"扫描到 {len(found)} 份数据，新增 {added} 份。")
+                        st.cache_data.clear()
+                        st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
 
     if load_errors:
         with st.expander(f"无法加载的数据源（{len(load_errors)}）", expanded=False):
@@ -134,7 +140,7 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
                 latest = strategy.latest_date.strftime("%Y-%m-%d") if strategy.latest_date is not None else "-"
                 top.caption(f"{path}  ·  最新数据 {latest}  ·  NAV {len(strategy.nav):,} 行")
             else:
-                top.markdown(f"**无法加载**")
+                top.markdown("**无法加载**")
                 top.caption(path)
 
             if remove_col.button("移除", key=f"remove-{index}", use_container_width=True):
@@ -202,17 +208,17 @@ def _render_overview(selected: list[StrategyData]) -> None:
         use_container_width=True,
         column_config={
             "NAV": st.column_config.NumberColumn(format="¥ %.2f"),
-            "累计收益": st.column_config.NumberColumn(format="%.2f%%"),
-            "年化收益": st.column_config.NumberColumn(format="%.2f%%"),
-            "最大回撤": st.column_config.NumberColumn(format="%.2f%%"),
+            "累计收益": st.column_config.NumberColumn(format="percent"),
+            "年化收益": st.column_config.NumberColumn(format="percent"),
+            "最大回撤": st.column_config.NumberColumn(format="percent"),
             "Sharpe": st.column_config.NumberColumn(format="%.2f"),
-            "年化波动": st.column_config.NumberColumn(format="%.2f%%"),
+            "年化波动": st.column_config.NumberColumn(format="percent"),
             "佣金": st.column_config.NumberColumn(format="¥ %.2f"),
             "滑点": st.column_config.NumberColumn(format="¥ %.2f"),
             "总成本": st.column_config.NumberColumn(format="¥ %.2f"),
             "分红": st.column_config.NumberColumn(format="¥ %.2f"),
             "现金": st.column_config.NumberColumn(format="¥ %.2f"),
-            "现金比例": st.column_config.NumberColumn(format="%.2f%%"),
+            "现金比例": st.column_config.NumberColumn(format="percent"),
         },
     )
 
@@ -323,8 +329,8 @@ def _render_positions(selected: list[StrategyData]) -> None:
             use_container_width=True,
             column_config={
                 "市值": st.column_config.NumberColumn(format="¥ %.2f"),
-                "实际权重": st.column_config.NumberColumn(format="%.2f%%"),
-                "目标权重": st.column_config.NumberColumn(format="%.2f%%"),
+                "实际权重": st.column_config.NumberColumn(format="percent"),
+                "目标权重": st.column_config.NumberColumn(format="percent"),
             },
         )
 
