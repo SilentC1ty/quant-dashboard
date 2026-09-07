@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from quant_dashboard.loader import load_strategy
 from quant_dashboard.metrics import strategy_metrics
+from quant_dashboard.models import StrategyData
 from quant_dashboard.sources import SourceRegistry, discover_strategy_dirs
 
 
@@ -90,3 +92,24 @@ def test_recursive_discovery_and_registry(tmp_path: Path) -> None:
 
     registry.remove(second)
     assert len(registry.load()) == 1
+
+
+def test_strategy_data_equality_never_compares_dataframes(tmp_path: Path) -> None:
+    frame = pd.DataFrame({"nav": [100000.0, 101000.0]})
+    common = {
+        "source_path": tmp_path,
+        "data_dir": tmp_path,
+        "project_root": None,
+        "display_name": "test",
+        "strategy_version": "v-test",
+        "rebalance_frequency": "W-FRI",
+        "rebalance_every": 1,
+        "nav": frame,
+    }
+    first = StrategyData(key="first", **common)
+    second = StrategyData(key="second", **common)
+
+    # Streamlit compares old/new widget values during reruns. This must yield a
+    # scalar bool rather than invoking pandas DataFrame equality.
+    assert (first == first) is True
+    assert (first == second) is False
