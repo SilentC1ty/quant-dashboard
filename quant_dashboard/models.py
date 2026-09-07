@@ -7,8 +7,16 @@ from typing import Any
 import pandas as pd
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class StrategyData:
+    """Loaded strategy snapshot.
+
+    Equality is intentionally disabled because the object contains pandas
+    DataFrames. Dataclass-generated equality would compare those frames with
+    ``==`` and produce a DataFrame of booleans, which Streamlit cannot coerce to
+    a single truth value while reconciling widget/session state.
+    """
+
     key: str
     source_path: Path
     data_dir: Path
