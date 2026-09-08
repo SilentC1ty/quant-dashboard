@@ -6,6 +6,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from quant_dashboard.benchmarks import (
+    benchmark_metrics,
+    benchmark_normalized,
+    collect_benchmarks,
+)
 from quant_dashboard.loader import load_strategy
 from quant_dashboard.metrics import strategy_metrics
 from quant_dashboard.models import StrategyData
@@ -21,7 +26,7 @@ def _write_minimal_project(root: Path, state_dir: str = "data/paper") -> Path:
         encoding="utf-8",
     )
     (root / "config" / "universe.yaml").write_text(
-        'names:\n  "510300": 沪深300ETF\n',
+        'asset_type: etf\nadjust: qfq\nnames:\n  "510300": 沪深300ETF\n  "511010": 国债ETF\n',
         encoding="utf-8",
     )
     (data_dir / "state.json").write_text(
@@ -55,6 +60,32 @@ def _write_minimal_project(root: Path, state_dir: str = "data/paper") -> Path:
         encoding="utf-8",
     )
     return data_dir
+
+
+def _enable_benchmarks(root: Path) -> None:
+    settings_path = root / "config" / "settings.yaml"
+    settings_path.write_text(
+        settings_path.read_text(encoding="utf-8")
+        + "cost:\n"
+        + "  commission: 0.0003\n"
+        + "  slippage: 0.0005\n"
+        + "benchmark:\n"
+        + '  csi300_symbol: "510300"\n'
+        + "  balanced_weights:\n"
+        + '    "510300": 0.60\n'
+        + '    "511010": 0.40\n',
+        encoding="utf-8",
+    )
+    cache_dir = root / "data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "etf_510300_qfq.csv").write_text(
+        "date,close\n2026-01-02,100\n2026-02-02,110\n",
+        encoding="utf-8",
+    )
+    (cache_dir / "etf_511010_qfq.csv").write_text(
+        "date,close\n2026-01-02,100\n2026-02-02,102\n",
+        encoding="utf-8",
+    )
 
 
 def test_discover_project_and_load_metadata(tmp_path: Path) -> None:
@@ -109,7 +140,28 @@ def test_strategy_data_equality_never_compares_dataframes(tmp_path: Path) -> Non
     first = StrategyData(key="first", **common)
     second = StrategyData(key="second", **common)
 
-    # Streamlit compares old/new widget values during reruns. This must yield a
-    # scalar bool rather than invoking pandas DataFrame equality.
     assert (first == first) is True
     assert (first == second) is False
+
+
+def test_benchmarks_load_from_local_quant_cache(tmp_path: Path) -> None:
+    root = tmp_path / "quant"
+    data_dir = _write_minimal_project(root)
+    _enable_benchmarks(root)
+    strategy = load_strategy(data_dir)
+
+    benchmarks, warnings = collect_benchmarks([strategy, strategy])
+    assert warnings == []
+    assert len(benchmarks) == 2
+
+    balanced = next(item for item in benchmarks if len(item.weights) == 2)
+    csi300 = next(item for item in benchmarks if item.weights == {"510300": 1.0})
+
+    balanced_metrics = benchmark_metrics(balanced)
+    csi_metrics = benchmark_metrics(csi300)
+    assert balanced_metrics["total_return"] == pytest.approx(1.068 / 1.0008 - 1.0)
+    assert csi_metrics["total_return"] == pytest.approx(1.1 / 1.0008 - 1.0)
+
+    normalized = benchmark_normalized(csi300)
+    assert normalized["normalized"].iloc[0] == pytest.approx(100 / 1.0008)
+    assert normalized["normalized"].iloc[-1] == pytest.approx(110 / 1.0008)

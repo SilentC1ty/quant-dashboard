@@ -6,6 +6,16 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from quant_dashboard.benchmarks import (
+    BenchmarkData,
+    benchmark_drawdown_curve,
+    benchmark_metrics,
+    benchmark_normalized,
+    benchmark_rolling_return,
+    benchmark_rolling_sharpe,
+    collect_benchmarks,
+    excess_return_curve,
+)
 from quant_dashboard.loader import load_strategy
 from quant_dashboard.metrics import (
     drawdown_curve,
@@ -61,6 +71,19 @@ def _unique_options(strategies: list[StrategyData]) -> tuple[dict[str, StrategyD
         seen[base] = seen.get(base, 0) + 1
         label = base if seen[base] == 1 else f"{base} [{strategy.key[-4:]}]"
         mapping[label] = strategy
+        options.append(label)
+    return mapping, options
+
+
+def _unique_benchmark_options(benchmarks: list[BenchmarkData]) -> tuple[dict[str, BenchmarkData], list[str]]:
+    mapping: dict[str, BenchmarkData] = {}
+    options: list[str] = []
+    seen: dict[str, int] = {}
+    for benchmark in benchmarks:
+        base = benchmark.display_name
+        seen[base] = seen.get(base, 0) + 1
+        label = base if seen[base] == 1 else f"{base} [{seen[base]}]"
+        mapping[label] = benchmark
         options.append(label)
     return mapping, options
 
@@ -170,9 +193,45 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
                     st.warning(warning)
 
 
-def _render_overview(selected: list[StrategyData]) -> None:
+def _render_benchmark_table(benchmarks: list[BenchmarkData]) -> None:
+    if not benchmarks:
+        return
+    rows = [benchmark_metrics(benchmark) for benchmark in benchmarks]
+    rows = [row for row in rows if row]
+    if not rows:
+        return
+
+    st.subheader("Benchmarks")
+    st.caption("基准使用 quant 项目的研究层复权价格缓存构造 Buy & Hold；只在起点建仓一次，并计入一次佣金和滑点。")
+    display = pd.DataFrame(rows).rename(
+        columns={
+            "benchmark": "基准",
+            "composition": "构成",
+            "latest_date": "最新日期",
+            "total_return": "累计收益",
+            "annualized_return": "年化收益",
+            "max_drawdown": "最大回撤",
+            "sharpe": "Sharpe",
+            "annualized_volatility": "年化波动",
+        }
+    )
+    st.dataframe(
+        display,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "累计收益": st.column_config.NumberColumn(format="percent"),
+            "年化收益": st.column_config.NumberColumn(format="percent"),
+            "最大回撤": st.column_config.NumberColumn(format="percent"),
+            "Sharpe": st.column_config.NumberColumn(format="%.2f"),
+            "年化波动": st.column_config.NumberColumn(format="percent"),
+        },
+    )
+
+
+def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkData]) -> None:
     st.title("Overview")
-    st.caption("各策略按自身初始资金计算累计表现；曲线统一归一化为初始值 100。")
+    st.caption("策略按自身初始资金计算累计表现；策略和基准曲线统一显示为财富指数 100。")
 
     rows = [strategy_metrics(strategy) for strategy in selected]
     rows = [row for row in rows if row]
@@ -222,13 +281,28 @@ def _render_overview(selected: list[StrategyData]) -> None:
         },
     )
 
+    _render_benchmark_table(benchmarks)
+
     fig = go.Figure()
     for strategy in selected:
         curve = normalized_nav(strategy)
         if curve.empty:
             continue
         fig.add_trace(go.Scatter(x=curve["date"], y=curve["normalized"], mode="lines", name=strategy.display_name))
-    fig.update_layout(title="归一化净值（初始 = 100）", xaxis_title=None, yaxis_title="净值指数", hovermode="x unified")
+    for benchmark in benchmarks:
+        curve = benchmark_normalized(benchmark)
+        if curve.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=curve["date"],
+                y=curve["normalized"],
+                mode="lines",
+                name=f"Benchmark · {benchmark.display_name}",
+                line={"dash": "dash"},
+            )
+        )
+    fig.update_layout(title="策略 vs Benchmark（财富指数）", xaxis_title=None, yaxis_title="初始 ≈ 100", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
     if len(rows) >= 2:
@@ -242,14 +316,20 @@ def _render_overview(selected: list[StrategyData]) -> None:
         c3.metric("策略数量", len(rows), f"最新 {max(latest_dates)}")
 
 
-def _render_performance(selected: list[StrategyData]) -> None:
+def _render_performance(selected: list[StrategyData], benchmarks: list[BenchmarkData]) -> None:
     st.title("Performance")
 
     nav_fig = go.Figure()
     dd_fig = go.Figure()
     return_fig = go.Figure()
     sharpe_fig = go.Figure()
-    window = st.selectbox("滚动窗口", options=[20, 63, 126, 252], index=1, format_func=lambda value: f"{value} 个交易日")
+    window = st.selectbox(
+        "滚动窗口",
+        options=[20, 63, 126, 252],
+        index=1,
+        format_func=lambda value: f"{value} 个交易日",
+        key="performance-rolling-window",
+    )
 
     for strategy in selected:
         curve = normalized_nav(strategy)
@@ -265,7 +345,22 @@ def _render_performance(selected: list[StrategyData]) -> None:
         if not rs.empty:
             sharpe_fig.add_trace(go.Scatter(x=rs["date"], y=rs["rolling_sharpe"], mode="lines", name=strategy.display_name))
 
-    nav_fig.update_layout(title="归一化净值", hovermode="x unified", yaxis_title="初始 = 100")
+    for benchmark in benchmarks:
+        name = f"Benchmark · {benchmark.display_name}"
+        curve = benchmark_normalized(benchmark)
+        if not curve.empty:
+            nav_fig.add_trace(go.Scatter(x=curve["date"], y=curve["normalized"], mode="lines", name=name, line={"dash": "dash"}))
+        dd = benchmark_drawdown_curve(benchmark)
+        if not dd.empty:
+            dd_fig.add_trace(go.Scatter(x=dd["date"], y=dd["drawdown"], mode="lines", name=name, line={"dash": "dash"}))
+        rr = benchmark_rolling_return(benchmark, window=window)
+        if not rr.empty:
+            return_fig.add_trace(go.Scatter(x=rr["date"], y=rr["rolling_return"], mode="lines", name=name, line={"dash": "dash"}))
+        rs = benchmark_rolling_sharpe(benchmark, window=window)
+        if not rs.empty:
+            sharpe_fig.add_trace(go.Scatter(x=rs["date"], y=rs["rolling_sharpe"], mode="lines", name=name, line={"dash": "dash"}))
+
+    nav_fig.update_layout(title="归一化净值 / Benchmark", hovermode="x unified", yaxis_title="初始 ≈ 100")
     dd_fig.update_layout(title="回撤", hovermode="x unified", yaxis_tickformat=".1%")
     return_fig.update_layout(title=f"{window} 日滚动收益", hovermode="x unified", yaxis_tickformat=".1%")
     sharpe_fig.update_layout(title=f"{window} 日滚动 Sharpe", hovermode="x unified")
@@ -274,6 +369,37 @@ def _render_performance(selected: list[StrategyData]) -> None:
     st.plotly_chart(dd_fig, use_container_width=True)
     st.plotly_chart(return_fig, use_container_width=True)
     st.plotly_chart(sharpe_fig, use_container_width=True)
+
+    if benchmarks:
+        st.subheader("累计超额收益")
+        st.caption("> 0 表示策略财富相对所选 Benchmark 领先；< 0 表示落后。")
+        benchmark_mapping, benchmark_options = _unique_benchmark_options(benchmarks)
+        primary_label = st.selectbox(
+            "超额收益基准",
+            benchmark_options,
+            key="performance-excess-benchmark",
+        )
+        primary = benchmark_mapping[primary_label]
+        excess_fig = go.Figure()
+        for strategy in selected:
+            curve = excess_return_curve(strategy, primary)
+            if curve.empty:
+                continue
+            excess_fig.add_trace(
+                go.Scatter(
+                    x=curve["date"],
+                    y=curve["excess_return"],
+                    mode="lines",
+                    name=strategy.display_name,
+                )
+            )
+        excess_fig.add_hline(y=0.0)
+        excess_fig.update_layout(
+            title=f"相对 {primary.display_name} 的累计超额收益",
+            hovermode="x unified",
+            yaxis_tickformat=".1%",
+        )
+        st.plotly_chart(excess_fig, use_container_width=True)
 
 
 def _latest_positions(strategy: StrategyData) -> pd.DataFrame:
@@ -346,7 +472,9 @@ def _render_positions(selected: list[StrategyData]) -> None:
         return
 
     st.subheader("历史仓位")
-    choice = st.selectbox("策略", history_candidates, format_func=lambda item: item.display_name)
+    history_mapping, history_options = _unique_options(history_candidates)
+    choice_label = st.selectbox("策略", history_options, key="positions-history-strategy")
+    choice = history_mapping[choice_label]
     positions = choice.positions.copy()
     positions["date"] = pd.to_datetime(positions["date"], errors="coerce")
     positions["symbol"] = positions["symbol"].astype(str)
@@ -431,7 +559,11 @@ def main() -> None:
     strategies, load_errors = _load_registered(registry)
 
     st.sidebar.title("Quant Dashboard")
-    page = st.sidebar.radio("页面", ["Overview", "Performance", "Positions", "Trades", "Data Sources"])
+    page = st.sidebar.radio(
+        "页面",
+        ["Overview", "Performance", "Positions", "Trades", "Data Sources"],
+        key="dashboard-page",
+    )
 
     if page == "Data Sources":
         _render_source_page(registry, strategies, load_errors)
@@ -446,19 +578,36 @@ def main() -> None:
         return
 
     mapping, options = _unique_options(strategies)
-    selected_labels = st.sidebar.multiselect("比较策略", options, default=options)
+    selected_labels = st.sidebar.multiselect("比较策略", options, default=options, key="strategy-selection")
     selected = [mapping[label] for label in selected_labels]
     if not selected:
         st.info("请至少选择一个策略。")
         return
 
+    available_benchmarks, benchmark_warnings = collect_benchmarks(selected)
+    selected_benchmarks: list[BenchmarkData] = []
+    if available_benchmarks:
+        benchmark_mapping, benchmark_options = _unique_benchmark_options(available_benchmarks)
+        selected_benchmark_labels = st.sidebar.multiselect(
+            "Benchmarks",
+            benchmark_options,
+            default=benchmark_options,
+            key="benchmark-selection",
+        )
+        selected_benchmarks = [benchmark_mapping[label] for label in selected_benchmark_labels]
+
     if load_errors:
         st.sidebar.warning(f"另有 {len(load_errors)} 个数据源加载失败")
+    if benchmark_warnings:
+        st.sidebar.warning(f"{len(benchmark_warnings)} 条 Benchmark 数据提示")
+        with st.sidebar.expander("Benchmark 数据提示", expanded=False):
+            for warning in benchmark_warnings:
+                st.caption(warning)
 
     if page == "Overview":
-        _render_overview(selected)
+        _render_overview(selected, selected_benchmarks)
     elif page == "Performance":
-        _render_performance(selected)
+        _render_performance(selected, selected_benchmarks)
     elif page == "Positions":
         _render_positions(selected)
     elif page == "Trades":
