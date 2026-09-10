@@ -304,7 +304,7 @@ def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkDat
             )
         )
     fig.update_layout(title="策略 vs Benchmark（财富指数）", xaxis_title=None, yaxis_title="初始 ≈ 100", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="overview-strategy-vs-benchmark")
 
     if len(rows) >= 2:
         st.subheader("当前差异")
@@ -366,10 +366,10 @@ def _render_performance(selected: list[StrategyData], benchmarks: list[Benchmark
     return_fig.update_layout(title=f"{window} 日滚动收益", hovermode="x unified", yaxis_tickformat=".1%")
     sharpe_fig.update_layout(title=f"{window} 日滚动 Sharpe", hovermode="x unified")
 
-    st.plotly_chart(nav_fig, use_container_width=True)
-    st.plotly_chart(dd_fig, use_container_width=True)
-    st.plotly_chart(return_fig, use_container_width=True)
-    st.plotly_chart(sharpe_fig, use_container_width=True)
+    st.plotly_chart(nav_fig, use_container_width=True, key="performance-nav")
+    st.plotly_chart(dd_fig, use_container_width=True, key="performance-drawdown")
+    st.plotly_chart(return_fig, use_container_width=True, key="performance-rolling-return")
+    st.plotly_chart(sharpe_fig, use_container_width=True, key="performance-rolling-sharpe")
 
     if benchmarks:
         st.subheader("累计超额收益")
@@ -400,7 +400,7 @@ def _render_performance(selected: list[StrategyData], benchmarks: list[Benchmark
             hovermode="x unified",
             yaxis_tickformat=".1%",
         )
-        st.plotly_chart(excess_fig, use_container_width=True)
+        st.plotly_chart(excess_fig, use_container_width=True, key="performance-excess-return")
 
 
 def _latest_positions(strategy: StrategyData) -> pd.DataFrame:
@@ -544,7 +544,11 @@ def _render_current_holding_returns(selected: list[StrategyData]) -> None:
                 yaxis_tickformat=".2%",
                 hovermode="x unified",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key=f"positions-holding-returns-{strategy.key}",
+            )
 
     if not any_data:
         st.info("当前没有足够的 positions.csv 数据来计算持仓收益走势。")
@@ -573,7 +577,7 @@ def _render_positions(selected: list[StrategyData]) -> None:
         for strategy_name, group in chart.groupby("策略"):
             fig.add_trace(go.Bar(name=strategy_name, x=group["标的"], y=group["实际权重"]))
         fig.update_layout(title="当前仓位对比", barmode="group", yaxis_tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="positions-current-allocation")
 
     _render_current_holding_returns(selected)
 
@@ -595,7 +599,11 @@ def _render_positions(selected: list[StrategyData]) -> None:
         for column in pivot.columns:
             fig.add_trace(go.Scatter(x=pivot.index, y=pivot[column], mode="lines", stackgroup="one", name=str(column)))
         fig.update_layout(title=f"{choice.display_name} 历史持仓权重", yaxis_tickformat=".0%", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=f"positions-history-weights-{choice.key}",
+        )
 
 
 def _with_strategy(strategy: StrategyData, frame: pd.DataFrame) -> pd.DataFrame:
