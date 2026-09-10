@@ -16,6 +16,7 @@ from quant_dashboard.benchmarks import (
     collect_benchmarks,
     excess_return_curve,
 )
+from quant_dashboard.holdings import current_holding_return_series
 from quant_dashboard.loader import load_strategy
 from quant_dashboard.metrics import (
     drawdown_curve,
@@ -442,6 +443,113 @@ def _latest_positions(strategy: StrategyData) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _render_current_holding_returns(selected: list[StrategyData]) -> None:
+    st.subheader("当前持仓收益走势")
+    st.caption(
+        "每条曲线从该标的本轮连续持有的首个每日收盘价归零，展示持仓期间的价格收益率。"
+        "该指标不分摊单笔佣金/滑点；ETF 分红现金计入账户 NAV，但不计入这里的单标的价格曲线。"
+    )
+
+    any_data = False
+    for strategy in selected:
+        holdings = current_holding_return_series(strategy)
+        metrics = strategy_metrics(strategy)
+        cash_weight = metrics.get("cash_weight") if metrics else None
+        if not holdings and cash_weight is None:
+            continue
+
+        any_data = True
+        with st.container(border=True):
+            st.markdown(f"**{strategy.display_name}**")
+
+            summary_rows: list[dict[str, object]] = []
+            for holding in holdings:
+                summary_rows.append(
+                    {
+                        "标的": holding.name,
+                        "代码": holding.symbol,
+                        "本轮持有起点": holding.start_date.strftime("%Y-%m-%d"),
+                        "最新日期": holding.latest_date.strftime("%Y-%m-%d"),
+                        "当前权重": holding.current_weight,
+                        "持仓期价格收益": holding.latest_return,
+                    }
+                )
+
+            if cash_weight is not None:
+                latest = metrics.get("latest_date") if metrics else "-"
+                summary_rows.append(
+                    {
+                        "标的": "现金",
+                        "代码": "CASH",
+                        "本轮持有起点": "-",
+                        "最新日期": latest,
+                        "当前权重": cash_weight,
+                        "持仓期价格收益": 0.0,
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "当前权重": st.column_config.NumberColumn(format="percent"),
+                    "持仓期价格收益": st.column_config.NumberColumn(format="percent"),
+                },
+            )
+
+            fig = go.Figure()
+            earliest: pd.Timestamp | None = None
+            latest: pd.Timestamp | None = None
+            for holding in holdings:
+                curve = holding.curve
+                if curve.empty:
+                    continue
+                earliest = holding.start_date if earliest is None else min(earliest, holding.start_date)
+                latest = holding.latest_date if latest is None else max(latest, holding.latest_date)
+                fig.add_trace(
+                    go.Scatter(
+                        x=curve["date"],
+                        y=curve["return"],
+                        mode="lines+markers",
+                        name=f"{holding.name} · {holding.symbol}",
+                    )
+                )
+
+            if cash_weight is not None and earliest is not None and latest is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[earliest, latest],
+                        y=[0.0, 0.0],
+                        mode="lines",
+                        name="现金",
+                        line={"dash": "dot"},
+                    )
+                )
+            elif not holdings and cash_weight is not None and strategy.latest_date is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[strategy.latest_date],
+                        y=[0.0],
+                        mode="markers",
+                        name="现金",
+                    )
+                )
+
+            fig.add_hline(y=0.0)
+            fig.update_layout(
+                title="本轮当前持仓价格收益率",
+                xaxis_title=None,
+                yaxis_title="相对持仓起点",
+                yaxis_tickformat=".2%",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    if not any_data:
+        st.info("当前没有足够的 positions.csv 数据来计算持仓收益走势。")
+
+
 def _render_positions(selected: list[StrategyData]) -> None:
     st.title("Positions")
     current = pd.concat([_latest_positions(strategy) for strategy in selected], ignore_index=True)
@@ -466,6 +574,8 @@ def _render_positions(selected: list[StrategyData]) -> None:
             fig.add_trace(go.Bar(name=strategy_name, x=group["标的"], y=group["实际权重"]))
         fig.update_layout(title="当前仓位对比", barmode="group", yaxis_tickformat=".0%")
         st.plotly_chart(fig, use_container_width=True)
+
+    _render_current_holding_returns(selected)
 
     history_candidates = [strategy for strategy in selected if not strategy.positions.empty and "date" in strategy.positions.columns]
     if not history_candidates:
