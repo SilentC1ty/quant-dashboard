@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 
-REGISTRY_PATH = Path.home() / ".quant-dashboard" / "sources.json"
+REGISTRY_PATH = Path(os.environ.get("QUANT_DASHBOARD_REGISTRY", str(Path.home() / ".quant-dashboard" / "sources.json")))
 CORE_FILES = ("state.json", "nav.csv")
 OPTIONAL_FILES = ("positions.csv", "orders.csv", "fills.csv", "cash_events.csv")
 
@@ -88,8 +89,8 @@ def discover_strategy_dirs(path: str | Path, recursive: bool = False) -> list[Pa
 class SourceRegistry:
     """Small local registry containing paths only; trading data remains untouched."""
 
-    def __init__(self, path: Path = REGISTRY_PATH) -> None:
-        self.path = path
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path or os.environ.get("QUANT_DASHBOARD_REGISTRY", REGISTRY_PATH))
 
     def load(self) -> list[dict[str, str]]:
         if not self.path.is_file():

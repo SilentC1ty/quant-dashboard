@@ -10,6 +10,7 @@ import yaml
 
 from .models import StrategyData
 from .sources import find_project_root, normalize_path
+from .quality import validate_snapshot
 
 
 CSV_FILES = {
@@ -43,6 +44,7 @@ NUMERIC_COLUMNS = {
     "slippage_cost",
     "cash_per_share",
     "cash_amount",
+    "dividend_receivable",
 }
 
 
@@ -51,9 +53,11 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         return {}
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"配置文件解析失败：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"配置内容不是对象：{path}")
+    return raw
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -61,24 +65,34 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"状态文件解析失败：{path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"状态内容不是对象：{path}")
+    return raw
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
     if not path.is_file():
         return pd.DataFrame()
     try:
-        frame = pd.read_csv(path)
-    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-        return pd.DataFrame()
+        frame = pd.read_csv(path, dtype={"symbol": str, "order_id": str})
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        raise ValueError(f"CSV 无法解析：{path.name}") from exc
 
     for column in DATE_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_datetime(frame[column], errors="coerce")
+            if frame[column].isna().any():
+                raise ValueError(f"{path.name} 含无效日期：{column}")
     for column in NUMERIC_COLUMNS.intersection(frame.columns):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        nullable = column == "fill_price" and "status" in frame
+        bad = frame[column].isna() | frame[column].isin([float("inf"), -float("inf")])
+        if nullable:
+            bad &= frame.status.ne("REJECTED")
+        if bad.any():
+            raise ValueError(f"{path.name} 含无效数值：{column}")
 
     sort_columns = [name for name in DATE_COLUMNS if name in frame.columns]
     if sort_columns:
@@ -109,6 +123,17 @@ def load_strategy(data_dir: str | Path, custom_label: str = "") -> StrategyData:
     data_path = normalize_path(data_dir)
     if not data_path.is_dir():
         raise FileNotFoundError(f"数据目录不存在：{data_path}")
+
+    manifest_path = data_path / "ledger_manifest.json"
+    manifest_before = manifest_path.read_bytes() if manifest_path.exists() else None
+    if manifest_before is not None:
+        manifest = json.loads(manifest_before)
+        for name, expected in manifest.get("files", {}).items():
+            if name not in ("state.json", *CSV_FILES.values()):
+                raise ValueError("账本清单包含未知文件")
+            path = data_path / name
+            if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise ValueError("账本尚未完整提交或文件已变化；请刷新重试")
 
     state = _read_json(data_path / "state.json")
     nav = _read_csv(data_path / "nav.csv")
@@ -153,7 +178,7 @@ def load_strategy(data_dir: str | Path, custom_label: str = "") -> StrategyData:
 
     frames = {name: _read_csv(data_path / filename) for name, filename in CSV_FILES.items() if name != "nav"}
 
-    return StrategyData(
+    strategy = StrategyData(
         key=_source_key(data_path),
         source_path=data_path,
         data_dir=data_path,
@@ -173,3 +198,15 @@ def load_strategy(data_dir: str | Path, custom_label: str = "") -> StrategyData:
         cash_events=frames["cash_events"],
         warnings=warnings,
     )
+    strategy.warnings.extend(validate_snapshot(strategy))
+    for name, filename in CSV_FILES.items():
+        if name != "nav" and not (data_path / filename).exists():
+            strategy.warnings.append(f"{filename} 不存在；对应明细不可用。")
+    if manifest_before is not None and manifest_path.read_bytes() != manifest_before:
+        raise ValueError("读取期间账本发生更新；请刷新重试")
+    # Check the same bytes again after reading, so a writer cannot expose a mixed snapshot.
+    if manifest_before is not None:
+        for name, expected in manifest["files"].items():
+            if hashlib.sha256((data_path / name).read_bytes()).hexdigest() != expected:
+                raise ValueError("读取期间账本发生更新；请刷新重试")
+    return strategy

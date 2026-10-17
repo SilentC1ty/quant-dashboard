@@ -17,6 +17,8 @@ from quant_dashboard.benchmarks import (
     excess_return_curve,
 )
 from quant_dashboard.holdings import current_holding_return_series
+from quant_dashboard.contributions import holding_total_return, symbol_contributions
+from quant_dashboard.orders import current_orders
 from quant_dashboard.loader import load_strategy
 from quant_dashboard.metrics import (
     drawdown_curve,
@@ -26,7 +28,7 @@ from quant_dashboard.metrics import (
     strategy_metrics,
 )
 from quant_dashboard.models import StrategyData
-from quant_dashboard.sources import OPTIONAL_FILES, SourceRegistry, discover_strategy_dirs
+from quant_dashboard.sources import OPTIONAL_FILES, SourceRegistry, discover_strategy_dirs, find_project_root
 
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📈", layout="wide")
@@ -40,13 +42,20 @@ def _load_cached(path: str, label: str, signature: tuple[tuple[str, float, int],
 
 
 def _file_signature(data_dir: Path) -> tuple[tuple[str, float, int], ...]:
-    names = ("state.json", "nav.csv", *OPTIONAL_FILES)
+    names = ("state.json", "nav.csv", "ledger_manifest.json", *OPTIONAL_FILES)
     signature: list[tuple[str, float, int]] = []
     for name in names:
         path = data_dir / name
         if path.is_file():
             stat = path.stat()
-            signature.append((name, stat.st_mtime, stat.st_size))
+            signature.append((name, stat.st_mtime_ns, stat.st_size))
+    root = find_project_root(data_dir)
+    if root:
+        paths = [*(root / "config").glob("*.yaml"), *(root / "data" / "cache").glob("*.csv"),
+                 *(root / "data" / "execution_cache").glob("*.csv")]
+        for path in sorted(paths):
+            stat = path.stat()
+            signature.append((str(path), stat.st_mtime_ns, stat.st_size))
     return tuple(signature)
 
 
@@ -110,7 +119,7 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
         custom_label = st.text_input("自定义名称（可选，仅单个数据源时使用）", placeholder="例如 Weekly V0.3")
         col1, col2, _ = st.columns([1, 1, 3])
 
-        if col1.button("添加", type="primary", use_container_width=True):
+        if col1.button("添加", type="primary", width="stretch"):
             if not source_path.strip():
                 st.warning("请输入目录路径。")
             else:
@@ -126,7 +135,7 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
                 except Exception as exc:
                     st.error(str(exc))
 
-        if col2.button("递归扫描", use_container_width=True):
+        if col2.button("递归扫描", width="stretch"):
             if not source_path.strip():
                 st.warning("请输入目录路径。")
             else:
@@ -167,7 +176,7 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
                 top.markdown("**无法加载**")
                 top.caption(path)
 
-            if remove_col.button("移除", key=f"remove-{index}", use_container_width=True):
+            if remove_col.button("移除", key=f"remove-{index}", width="stretch"):
                 registry.remove(path)
                 st.cache_data.clear()
                 st.rerun()
@@ -180,7 +189,7 @@ def _render_source_page(registry: SourceRegistry, strategies: list[StrategyData]
                 key=f"label-{index}",
                 label_visibility="collapsed",
             )
-            if save_col.button("保存名称", key=f"save-label-{index}", use_container_width=True):
+            if save_col.button("保存名称", key=f"save-label-{index}", width="stretch"):
                 registry.update_label(path, new_label)
                 st.cache_data.clear()
                 st.rerun()
@@ -203,7 +212,7 @@ def _render_benchmark_table(benchmarks: list[BenchmarkData]) -> None:
         return
 
     st.subheader("Benchmarks")
-    st.caption("基准使用 quant 项目的研究层复权价格缓存构造 Buy & Hold；只在起点建仓一次，并计入一次佣金和滑点。")
+    st.caption("市场基准使用复权价格及一次比例成本，不取整；同初始持仓基准使用实际首批成交、佣金、现金和分红，之后不再交易。每条基准对应其策略的数据源与日期范围。")
     display = pd.DataFrame(rows).rename(
         columns={
             "benchmark": "基准",
@@ -216,10 +225,12 @@ def _render_benchmark_table(benchmarks: list[BenchmarkData]) -> None:
             "annualized_volatility": "年化波动",
         }
     )
+    if display["年化收益"].isna().all():
+        display = display.drop(columns="年化收益")
     st.dataframe(
         display,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "累计收益": st.column_config.NumberColumn(format="percent"),
             "年化收益": st.column_config.NumberColumn(format="percent"),
@@ -233,6 +244,7 @@ def _render_benchmark_table(benchmarks: list[BenchmarkData]) -> None:
 def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkData]) -> None:
     st.title("Overview")
     st.caption("策略按自身初始资金计算累计表现；策略和基准曲线统一显示为财富指数 100。")
+    st.caption("样本不足 365 天时隐藏年化收益。Sharpe 假设无风险利率为 0，按 252 日年化；短样本仅作描述。收益序列含初始资金至首个 NAV 的变化，包含首日费用。")
 
     rows = [strategy_metrics(strategy) for strategy in selected]
     rows = [row for row in rows if row]
@@ -260,12 +272,18 @@ def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkDat
             "dividends": "分红",
             "cash": "现金",
             "cash_weight": "现金比例",
+            "dividend_receivable": "应收分红",
+            "nav_samples": "NAV 样本数",
+            "return_samples": "收益样本数",
+            "elapsed_days": "日历天数",
         }
     )
+    if display["年化收益"].isna().all():
+        display = display.drop(columns="年化收益")
     st.dataframe(
         display,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "NAV": st.column_config.NumberColumn(format="¥ %.2f"),
             "累计收益": st.column_config.NumberColumn(format="percent"),
@@ -279,6 +297,7 @@ def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkDat
             "分红": st.column_config.NumberColumn(format="¥ %.2f"),
             "现金": st.column_config.NumberColumn(format="¥ %.2f"),
             "现金比例": st.column_config.NumberColumn(format="percent"),
+            "应收分红": st.column_config.NumberColumn(format="¥ %.2f"),
         },
     )
 
@@ -304,7 +323,7 @@ def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkDat
             )
         )
     fig.update_layout(title="策略 vs Benchmark（财富指数）", xaxis_title=None, yaxis_title="初始 ≈ 100", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True, key="overview-strategy-vs-benchmark")
+    st.plotly_chart(fig, width="stretch", key="overview-strategy-vs-benchmark")
 
     if len(rows) >= 2:
         st.subheader("当前差异")
@@ -319,6 +338,7 @@ def _render_overview(selected: list[StrategyData], benchmarks: list[BenchmarkDat
 
 def _render_performance(selected: list[StrategyData], benchmarks: list[BenchmarkData]) -> None:
     st.title("Performance")
+    st.caption("Sharpe 假设无风险利率为 0，按 252 日年化；短样本仅作描述。收益样本包含期初资金至首个 NAV 的变化。")
 
     nav_fig = go.Figure()
     dd_fig = go.Figure()
@@ -366,14 +386,24 @@ def _render_performance(selected: list[StrategyData], benchmarks: list[Benchmark
     return_fig.update_layout(title=f"{window} 日滚动收益", hovermode="x unified", yaxis_tickformat=".1%")
     sharpe_fig.update_layout(title=f"{window} 日滚动 Sharpe", hovermode="x unified")
 
-    st.plotly_chart(nav_fig, use_container_width=True, key="performance-nav")
-    st.plotly_chart(dd_fig, use_container_width=True, key="performance-drawdown")
-    st.plotly_chart(return_fig, use_container_width=True, key="performance-rolling-return")
-    st.plotly_chart(sharpe_fig, use_container_width=True, key="performance-rolling-sharpe")
+    st.plotly_chart(nav_fig, width="stretch", key="performance-nav")
+    st.plotly_chart(dd_fig, width="stretch", key="performance-drawdown")
+    for strategy in selected:
+        count = len(strategy.nav)
+        if count < window:
+            st.info(f"{strategy.display_name}：当前 {count} 个收益样本，{window} 日滚动窗口还需 {window - count} 个。")
+    if return_fig.data:
+        st.plotly_chart(return_fig, width="stretch", key="performance-rolling-return")
+    if sharpe_fig.data:
+        st.plotly_chart(sharpe_fig, width="stretch", key="performance-rolling-sharpe")
+    elif return_fig.data:
+        st.info("滚动 Sharpe 暂不可计算：窗口内波动为零或有效样本不足。")
 
     if benchmarks:
         st.subheader("累计超额收益")
-        st.caption("> 0 表示策略财富相对所选 Benchmark 领先；< 0 表示落后。")
+        mode_label = st.radio("超额计算方式", ["累计收益差（百分点）", "相对财富比（%）"], horizontal=True, key="excess-mode")
+        mode = "difference" if mode_label == "累计收益差（百分点）" else "relative"
+        st.caption("收益差 = 策略累计收益 − 基准累计收益；相对财富比 = 策略财富 ÷ 基准财富 − 1。仅比较同源且完整日期对齐的策略。")
         benchmark_mapping, benchmark_options = _unique_benchmark_options(benchmarks)
         primary_label = st.selectbox(
             "超额收益基准",
@@ -383,24 +413,25 @@ def _render_performance(selected: list[StrategyData], benchmarks: list[Benchmark
         primary = benchmark_mapping[primary_label]
         excess_fig = go.Figure()
         for strategy in selected:
-            curve = excess_return_curve(strategy, primary)
+            curve = excess_return_curve(strategy, primary, mode=mode)
             if curve.empty:
                 continue
             excess_fig.add_trace(
                 go.Scatter(
                     x=curve["date"],
-                    y=curve["excess_return"],
+                    y=curve["excess_return"] * (100. if mode == "difference" else 1.),
                     mode="lines",
                     name=strategy.display_name,
                 )
             )
         excess_fig.add_hline(y=0.0)
         excess_fig.update_layout(
-            title=f"相对 {primary.display_name} 的累计超额收益",
+            title=f"{primary.display_name} · {mode_label}",
             hovermode="x unified",
-            yaxis_tickformat=".1%",
+            yaxis_tickformat=".2f" if mode == "difference" else ".1%",
+            yaxis_title="百分点" if mode == "difference" else "相对财富收益率",
         )
-        st.plotly_chart(excess_fig, use_container_width=True, key="performance-excess-return")
+        st.plotly_chart(excess_fig, width="stretch", key="performance-excess-return")
 
 
 def _latest_positions(strategy: StrategyData) -> pd.DataFrame:
@@ -440,6 +471,10 @@ def _latest_positions(strategy: StrategyData) -> pd.DataFrame:
                 "目标权重": None,
             }
         )
+        if metrics.get("dividend_receivable", 0):
+            rows.append({"策略": strategy.display_name, "日期": metrics["latest_date"], "标的": "应收分红", "代码": "RECEIVABLE",
+                         "数量": None, "市值": metrics["dividend_receivable"],
+                         "实际权重": float(metrics["dividend_receivable"]) / float(metrics["nav"]), "目标权重": None})
     return pd.DataFrame(rows)
 
 
@@ -491,7 +526,7 @@ def _render_current_holding_returns(selected: list[StrategyData]) -> None:
             st.dataframe(
                 pd.DataFrame(summary_rows),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "当前权重": st.column_config.NumberColumn(format="percent"),
                     "持仓期价格收益": st.column_config.NumberColumn(format="percent"),
@@ -546,9 +581,26 @@ def _render_current_holding_returns(selected: list[StrategyData]) -> None:
             )
             st.plotly_chart(
                 fig,
-                use_container_width=True,
+                width="stretch",
                 key=f"positions-holding-returns-{strategy.key}",
             )
+            total_fig = go.Figure()
+            for holding in holdings:
+                try:
+                    curve = holding_total_return(strategy, holding.symbol, holding.start_date)
+                    total_fig.add_trace(go.Scatter(x=curve.date, y=curve["return"], mode="lines", name=holding.name))
+                except (ValueError, OSError, KeyError) as exc:
+                    st.info(str(exc))
+            if total_fig.data:
+                total_fig.update_layout(title="本轮持仓含分红收益率（每份分红再投资口径）", yaxis_tickformat=".2%", hovermode="x unified")
+                st.plotly_chart(total_fig, width="stretch", key=f"positions-total-returns-{strategy.key}")
+            try:
+                contribution = symbol_contributions(strategy)
+                if not contribution.empty:
+                    st.caption("账户净贡献含已实现收益、当前市值、已赚取分红及佣金；滑点已包含在成交金额中。贡献百分点 = 净贡献 ÷ 账户期初资产 × 100。")
+                    st.dataframe(contribution.rename(columns={"symbol": "代码", "name": "标的", "net_pnl": "净贡献（元）", "contribution_pp": "贡献（百分点）", "dividends_earned": "已赚取分红（元）"}), hide_index=True, width="stretch")
+            except ValueError as exc:
+                st.info(str(exc))
 
     if not any_data:
         st.info("当前没有足够的 positions.csv 数据来计算持仓收益走势。")
@@ -564,7 +616,7 @@ def _render_positions(selected: list[StrategyData]) -> None:
         st.dataframe(
             current,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "市值": st.column_config.NumberColumn(format="¥ %.2f"),
                 "实际权重": st.column_config.NumberColumn(format="percent"),
@@ -577,7 +629,7 @@ def _render_positions(selected: list[StrategyData]) -> None:
         for strategy_name, group in chart.groupby("策略"):
             fig.add_trace(go.Bar(name=strategy_name, x=group["标的"], y=group["实际权重"]))
         fig.update_layout(title="当前仓位对比", barmode="group", yaxis_tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True, key="positions-current-allocation")
+        st.plotly_chart(fig, width="stretch", key="positions-current-allocation")
 
     _render_current_holding_returns(selected)
 
@@ -601,7 +653,7 @@ def _render_positions(selected: list[StrategyData]) -> None:
         fig.update_layout(title=f"{choice.display_name} 历史持仓权重", yaxis_tickformat=".0%", hovermode="x unified")
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            width="stretch",
             key=f"positions-history-weights-{choice.key}",
         )
 
@@ -619,7 +671,8 @@ def _with_strategy(strategy: StrategyData, frame: pd.DataFrame) -> pd.DataFrame:
 def _render_trades(selected: list[StrategyData]) -> None:
     st.title("Trades")
     fill_frames = [_with_strategy(strategy, strategy.fills) for strategy in selected if not strategy.fills.empty]
-    order_frames = [_with_strategy(strategy, strategy.orders) for strategy in selected if not strategy.orders.empty]
+    order_frames = [_with_strategy(strategy, current_orders(strategy)) for strategy in selected]
+    order_frames = [frame for frame in order_frames if not frame.empty]
 
     fill_tab, order_tab, cost_tab = st.tabs(["成交", "订单", "成本"])
     with fill_tab:
@@ -630,9 +683,10 @@ def _render_trades(selected: list[StrategyData]) -> None:
             sort_col = "trade_date" if "trade_date" in fills.columns else None
             if sort_col:
                 fills = fills.sort_values(sort_col, ascending=False)
-            st.dataframe(fills, hide_index=True, use_container_width=True)
+            st.dataframe(fills, hide_index=True, width="stretch")
 
     with order_tab:
+        st.caption("当前状态由订单、成交和待成交队列核对；历史创建状态另列保留。部分成交区分仍待执行与已结束；状态未知或记录冲突需要核查。")
         if not order_frames:
             st.info("暂无订单记录。")
         else:
@@ -640,7 +694,17 @@ def _render_trades(selected: list[StrategyData]) -> None:
             sort_col = "signal_date" if "signal_date" in orders.columns else None
             if sort_col:
                 orders = orders.sort_values(sort_col, ascending=False)
-            st.dataframe(orders, hide_index=True, use_container_width=True)
+            labels = {"FILLED": "已成交", "PENDING": "待成交", "PARTIAL_PENDING": "部分成交，仍待执行",
+                      "PARTIAL_CLOSED": "部分成交，已结束", "REJECTED": "被拒绝", "UNKNOWN": "状态未知",
+                      "CONFLICT": "记录冲突", "CANCELLED": "已取消"}
+            orders["current_status"] = orders.current_status.map(labels).fillna(orders.current_status)
+            orders["side"] = orders.side.map({"BUY": "买入", "SELL": "卖出"}).fillna(orders.side)
+            orders = orders.drop(columns="strategy_key", errors="ignore").rename(columns={
+                "strategy": "策略", "order_id": "订单号", "current_status": "当前状态", "symbol": "代码", "name": "标的",
+                "side": "方向", "requested_qty": "委托数量", "filled_qty": "已成交数量", "remaining_qty": "未成交数量",
+                "reason": "核验提示", "status": "历史创建状态", "signal_date": "信号日期", "signal_price": "信号价格",
+                "target_weight": "目标权重", "trade_date": "成交日期"})
+            st.dataframe(orders, hide_index=True, width="stretch")
 
     with cost_tab:
         rows = []
@@ -662,7 +726,7 @@ def _render_trades(selected: list[StrategyData]) -> None:
         st.dataframe(
             costs,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "佣金": st.column_config.NumberColumn(format="¥ %.2f"),
                 "滑点": st.column_config.NumberColumn(format="¥ %.2f"),
@@ -677,6 +741,9 @@ def main() -> None:
     strategies, load_errors = _load_registered(registry)
 
     st.sidebar.title("Quant Dashboard")
+    if st.sidebar.button("刷新数据", key="refresh-data"):
+        st.cache_data.clear()
+        st.rerun()
     page = st.sidebar.radio(
         "页面",
         ["Overview", "Performance", "Positions", "Trades", "Data Sources"],
@@ -695,9 +762,13 @@ def main() -> None:
                 st.error(error)
         return
 
-    mapping, options = _unique_options(strategies)
-    selected_labels = st.sidebar.multiselect("比较策略", options, default=options, key="strategy-selection")
-    selected = [mapping[label] for label in selected_labels]
+    label_mapping, _ = _unique_options(strategies)
+    mapping = {strategy.key: strategy for strategy in strategies}
+    labels = {strategy.key: label for label, strategy in label_mapping.items()}
+    options = list(mapping)
+    selected_keys = st.sidebar.multiselect("比较策略", options, default=options,
+                                           format_func=lambda key: labels[key], key="strategy-selection")
+    selected = [mapping[key] for key in selected_keys]
     if not selected:
         st.info("请至少选择一个策略。")
         return
@@ -716,6 +787,14 @@ def main() -> None:
 
     if load_errors:
         st.sidebar.warning(f"另有 {len(load_errors)} 个数据源加载失败")
+        with st.sidebar.expander("数据错误", expanded=True):
+            for error in load_errors:
+                st.error(error)
+    for strategy in selected:
+        if strategy.warnings:
+            with st.expander(f"{strategy.display_name} · 数据核验提示（{len(strategy.warnings)}）", expanded=False):
+                for warning in strategy.warnings:
+                    st.warning(warning)
     if benchmark_warnings:
         st.sidebar.warning(f"{len(benchmark_warnings)} 条 Benchmark 数据提示")
         with st.sidebar.expander("Benchmark 数据提示", expanded=False):

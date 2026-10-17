@@ -23,9 +23,11 @@ def clean_nav(strategy: StrategyData) -> pd.DataFrame:
 
 def daily_returns(strategy: StrategyData) -> pd.Series:
     nav = clean_nav(strategy)
-    if len(nav) < 2:
+    if nav.empty:
         return pd.Series(dtype=float)
-    values = nav.set_index("date")["nav"].pct_change().dropna()
+    values = nav.set_index("date")["nav"].pct_change(fill_method=None)
+    initial = float(strategy.state.get("initial_cash") or nav["nav"].iloc[0])
+    values.iloc[0] = float(nav["nav"].iloc[0]) / initial - 1.0
     return values.replace([math.inf, -math.inf], pd.NA).dropna().astype(float)
 
 
@@ -44,7 +46,7 @@ def drawdown_curve(strategy: StrategyData) -> pd.DataFrame:
     nav = clean_nav(strategy)
     if nav.empty:
         return pd.DataFrame(columns=["date", "drawdown"])
-    running_max = nav["nav"].cummax()
+    running_max = nav["nav"].cummax().clip(lower=float(strategy.state.get("initial_cash") or nav["nav"].iloc[0]))
     out = nav[["date"]].copy()
     out["drawdown"] = nav["nav"] / running_max - 1.0
     return out
@@ -55,7 +57,8 @@ def rolling_return(strategy: StrategyData, window: int = 63) -> pd.DataFrame:
     if nav.empty:
         return pd.DataFrame(columns=["date", "rolling_return"])
     out = nav[["date"]].copy()
-    out["rolling_return"] = nav["nav"].pct_change(window)
+    values = daily_returns(strategy)
+    out["rolling_return"] = (1 + values).rolling(window).apply(lambda v: v.prod(), raw=True).to_numpy() - 1
     return out.dropna()
 
 
@@ -63,7 +66,8 @@ def rolling_sharpe(strategy: StrategyData, window: int = 63) -> pd.DataFrame:
     nav = clean_nav(strategy)
     if nav.empty:
         return pd.DataFrame(columns=["date", "rolling_sharpe"])
-    returns = nav["nav"].pct_change()
+    returns = daily_returns(strategy).to_numpy()
+    returns = pd.Series(returns, index=nav.index)
     mean = returns.rolling(window).mean()
     std = returns.rolling(window).std(ddof=1)
     out = nav[["date"]].copy()
@@ -78,10 +82,10 @@ def _latest_numeric(frame: pd.DataFrame, column: str) -> float | None:
     return float(values.iloc[-1]) if not values.empty else None
 
 
-def _filled_trade_count(strategy: StrategyData) -> int:
+def _filled_trade_count(strategy: StrategyData) -> int | None:
     fills = strategy.fills
     if fills.empty:
-        return 0
+        return 0 if (strategy.data_dir / "fills.csv").is_file() else None
     if "filled_qty" in fills.columns:
         qty = pd.to_numeric(fills["filled_qty"], errors="coerce").fillna(0)
         return int((qty > 0).sum())
@@ -119,7 +123,7 @@ def strategy_metrics(strategy: StrategyData) -> dict[str, float | int | str | No
     last_date = pd.Timestamp(nav["date"].iloc[-1])
     elapsed_days = max((last_date - first_date).days, 0)
     annualized_return = None
-    if elapsed_days >= 30 and latest_nav > 0 and initial_cash > 0:
+    if elapsed_days >= 365 and latest_nav > 0 and initial_cash > 0:
         annualized_return = (latest_nav / initial_cash) ** (365.25 / elapsed_days) - 1.0
 
     returns = daily_returns(strategy)
@@ -159,4 +163,8 @@ def strategy_metrics(strategy: StrategyData) -> dict[str, float | int | str | No
         "dividends": dividends,
         "cash": latest_cash,
         "cash_weight": cash_weight,
+        "dividend_receivable": _latest_numeric(nav, "dividend_receivable") or 0.0,
+        "nav_samples": len(nav),
+        "return_samples": len(returns),
+        "elapsed_days": elapsed_days,
     }

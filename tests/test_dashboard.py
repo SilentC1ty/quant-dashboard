@@ -151,7 +151,8 @@ def test_benchmarks_load_from_local_quant_cache(tmp_path: Path) -> None:
     strategy = load_strategy(data_dir)
 
     benchmarks, warnings = collect_benchmarks([strategy, strategy])
-    assert warnings == []
+    assert len(warnings) == 1
+    assert "同初始持仓基准不可用" in warnings[0]
     assert len(benchmarks) == 2
 
     balanced = next(item for item in benchmarks if len(item.weights) == 2)

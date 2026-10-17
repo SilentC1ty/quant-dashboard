@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "profile": "product-admin",
+  "sourceRoots": ["app.py", "quant_dashboard"],
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": ["Table Selection", "Select/Listbox", "Form", "Scrollbar", "Toast", "CRUD"],
+  "ownership": {"select": "authored", "form": "streamlit", "scrollbar": "native"},
+  "requiredCommands": ["accuracy", "ui"],
+  "commands": {"accuracy": "python -m pytest -q tests/test_accuracy.py", "ui": "python -m pytest -q tests/test_ui.py"},
+  "evidence": {"crudFullFlow": "tests/test_ui.py", "failurePaths": "tests/test_ui.py"}
+}

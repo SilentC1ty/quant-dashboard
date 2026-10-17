@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,8 @@ class BenchmarkData:
     weights: dict[str, float]
     equity: pd.Series
     source_project: Path
+    source_strategy_key: str = ""
+    method: str = "adjusted_fractional_buy_hold"
 
     @property
     def composition(self) -> str:
@@ -47,16 +50,19 @@ def _read_price_cache(path: Path, symbol: str) -> pd.Series:
         return pd.Series(dtype=float, name=symbol)
     try:
         raw = pd.read_csv(path)
-    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
-        return pd.Series(dtype=float, name=symbol)
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        raise ValueError(f"价格缓存解析失败：{path.name}") from exc
     if "date" not in raw.columns or "close" not in raw.columns:
         return pd.Series(dtype=float, name=symbol)
 
     frame = raw[["date", "close"]].copy()
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame = frame.dropna().drop_duplicates("date", keep="last").sort_values("date")
-    frame = frame[frame["close"] > 0]
+    if frame.isna().any().any() or (frame["close"] <= 0).any() or frame["close"].isin([math.inf, -math.inf]).any():
+        raise ValueError(f"价格缓存含无效值：{path.name}")
+    if frame.duplicated("date").any():
+        raise ValueError(f"价格缓存日期重复：{path.name}")
+    frame = frame.sort_values("date")
     if frame.empty:
         return pd.Series(dtype=float, name=symbol)
 
@@ -136,9 +142,6 @@ def load_benchmarks(strategy: StrategyData) -> tuple[list[BenchmarkData], list[s
     """Load configured benchmarks from a strategy's local quant research cache."""
 
     definitions = _benchmark_definitions(strategy)
-    if not definitions:
-        return [], []
-
     if strategy.project_root is None:
         return [], [f"{strategy.display_name}: 未找到项目根目录，无法读取 benchmark 价格缓存。"]
 
@@ -158,7 +161,11 @@ def load_benchmarks(strategy: StrategyData) -> tuple[list[BenchmarkData], list[s
             if cache_path is None:
                 missing.append(symbol)
                 continue
-            price = _read_price_cache(cache_path, symbol)
+            try:
+                price = _read_price_cache(cache_path, symbol)
+            except ValueError as exc:
+                missing.append(str(exc))
+                continue
             if price.empty:
                 missing.append(f"{symbol} ({cache_path})")
             else:
@@ -178,6 +185,12 @@ def load_benchmarks(strategy: StrategyData) -> tuple[list[BenchmarkData], list[s
             warnings.append(f"{strategy.display_name}: {label} 在模拟盘日期范围内没有可用价格。")
             continue
 
+        expected = pd.DatetimeIndex(pd.to_datetime(strategy.nav.date))
+        if prices.reindex(expected).isna().any().any():
+            warnings.append(f"{strategy.display_name}: {label} 缺少策略区间的价格，暂停基准比较。")
+            continue
+        prices = prices.reindex(expected)
+
         try:
             equity = _build_buy_and_hold(prices, weights, commission, slippage, label)
         except ValueError as exc:
@@ -186,15 +199,95 @@ def load_benchmarks(strategy: StrategyData) -> tuple[list[BenchmarkData], list[s
 
         loaded.append(
             BenchmarkData(
-                key=key,
-                display_name=label,
+                key=key + ":" + hashlib.sha256((strategy.key + str(strategy.project_root) + str((start, end, commission, slippage)) + prices.to_csv()).encode()).hexdigest()[:16],
+                display_name=label + f" · {strategy.display_name}",
                 weights=weights,
                 equity=equity,
                 source_project=strategy.project_root,
+                source_strategy_key=strategy.key,
             )
         )
 
     return loaded, warnings
+
+
+def initial_fills_benchmark(strategy: StrategyData) -> BenchmarkData:
+    """Same actual initial fills/costs/cash, then no further trading or reinvesting."""
+    from .metrics import clean_nav
+    nav = clean_nav(strategy)
+    if nav.empty:
+        raise ValueError("没有 NAV 日期")
+    dates = pd.DatetimeIndex(nav.date)
+    initial = float(strategy.state["initial_cash"])
+    origin = strategy.state.get("origin", {})
+    opening = origin.get("opening_holdings", {})
+    if opening:
+        quantities = {str(k): int(v) for k, v in opening.items()}
+        invested_at = pd.Timestamp(origin["opening_date"])
+        cash = float(origin["opening_cash"])
+        opening_recv = float(nav.get("dividend_receivable", pd.Series([0.])).iloc[0])
+        identity = json.dumps(origin, sort_keys=True)
+    else:
+        fills = strategy.fills
+        if fills.empty or not {"trade_date", "side", "filled_qty", "notional", "commission"}.issubset(fills):
+            raise ValueError("初始成交明细不完整")
+        valid = fills.loc[fills.filled_qty > 0].sort_values("trade_date")
+        if valid.empty:
+            raise ValueError("尚未建仓")
+        invested_at = pd.Timestamp(valid.trade_date.min())
+        entry = valid.loc[valid.trade_date == invested_at]
+        if entry.side.ne("BUY").any():
+            raise ValueError("首批成交含卖出，无法确定初始组合")
+        quantities = {str(k): int(v) for k, v in entry.groupby("symbol").filled_qty.sum().items()}
+        cash = initial - float((entry.notional + entry.commission).sum())
+        opening_recv = 0.
+        identity = entry.to_csv(index=False)
+    if cash < -.01:
+        raise ValueError("首批成交超过初始现金")
+    equity = pd.Series(initial, index=dates, dtype=float)
+    active = dates[dates >= invested_at]
+    equity.loc[active] = cash + opening_recv
+    weights = {}
+    for symbol, quantity in quantities.items():
+        prices = pd.Series(dtype=float)
+        if strategy.project_root:
+            path = strategy.project_root / "data" / "execution_cache" / f"etf_{symbol}_raw_close.csv"
+            prices = _read_price_cache(path, symbol)
+        marks = strategy.positions.loc[strategy.positions.symbol.astype(str) == symbol].set_index("date").close
+        if not prices.empty:
+            overlap = prices.index.intersection(marks.index)
+            if ((prices.loc[overlap] - marks.loc[overlap]).abs() > 1e-8).any():
+                raise ValueError(f"{symbol} 缓存与持仓价格冲突")
+        prices = prices.combine_first(marks)
+        selected = prices.reindex(active)
+        if selected.isna().any():
+            raise ValueError(f"{symbol} 缺少原始价格，无法模拟继续持有")
+        equity.loc[active] += selected * quantity
+        weights[symbol] = quantity * float(selected.iloc[0]) / initial
+        identity += selected.to_csv()
+        # Cash distributions are recognized economically on ex-date. No later
+        # trades use that cash, so settlement cannot inflate buying power here.
+        schedule_path = strategy.project_root / "data" / "execution_cache" / f"etf_{symbol}_dividend_schedule.csv" if strategy.project_root else None
+        legacy_path = strategy.project_root / "data" / "execution_cache" / f"etf_{symbol}_cash_dividend.csv" if strategy.project_root else None
+        if schedule_path and schedule_path.exists():
+            events = pd.read_csv(schedule_path, parse_dates=["ex_date", "record_date"])
+        elif legacy_path and legacy_path.exists():
+            events = pd.read_csv(legacy_path, parse_dates=["date"]).rename(columns={"date": "ex_date"})
+            events["record_date"] = events.ex_date - pd.Timedelta(days=1)
+        else:
+            raise ValueError(f"{symbol} 缺少完整分红历史，不能假定分红为零")
+        identity += events.to_csv(index=False)
+        if not events.empty:
+            if events[["ex_date", "record_date", "cash_per_share"]].isna().any().any() or events.ex_date.duplicated().any() or (events.cash_per_share < 0).any():
+                raise ValueError(f"{symbol} 分红事件无效")
+            for row in events.itertuples():
+                if row.record_date >= invested_at and (not opening or row.ex_date > invested_at):
+                    equity.loc[dates >= row.ex_date] += quantity * float(row.cash_per_share)
+    equity /= initial
+    label = f"同初始持仓后持有 · {strategy.display_name}"
+    return BenchmarkData(key="initial_fills:" + hashlib.sha256((strategy.key + identity + str(tuple(dates))).encode()).hexdigest()[:16],
+                         display_name=label, weights=weights, equity=equity, source_project=strategy.project_root or strategy.data_dir,
+                         source_strategy_key=strategy.key, method="actual_initial_fills_buy_hold")
 
 
 def collect_benchmarks(strategies: list[StrategyData]) -> tuple[list[BenchmarkData], list[str]]:
@@ -205,6 +298,10 @@ def collect_benchmarks(strategies: list[StrategyData]) -> tuple[list[BenchmarkDa
     seen_warnings: set[str] = set()
     for strategy in strategies:
         items, item_warnings = load_benchmarks(strategy)
+        try:
+            items.append(initial_fills_benchmark(strategy))
+        except (ValueError, OSError, KeyError) as exc:
+            item_warnings.append(f"{strategy.display_name}: 同初始持仓基准不可用：{exc}")
         for item in items:
             collected.setdefault(item.key, item)
         for warning in item_warnings:
@@ -234,7 +331,7 @@ def benchmark_drawdown_curve(benchmark: BenchmarkData) -> pd.DataFrame:
     equity = benchmark.equity.dropna().sort_index()
     if equity.empty:
         return pd.DataFrame(columns=["date", "drawdown"])
-    running_max = equity.cummax()
+    running_max = equity.cummax().clip(lower=1.)
     return pd.DataFrame({"date": equity.index, "drawdown": equity / running_max - 1.0})
 
 
@@ -242,7 +339,7 @@ def benchmark_rolling_return(benchmark: BenchmarkData, window: int = 63) -> pd.D
     equity = benchmark.equity.dropna().sort_index()
     if equity.empty:
         return pd.DataFrame(columns=["date", "rolling_return"])
-    rolling = equity.pct_change(window)
+    rolling = (1 + benchmark_returns(benchmark)).rolling(window).apply(lambda v: v.prod(), raw=True) - 1
     return pd.DataFrame({"date": equity.index, "rolling_return": rolling.to_numpy()}).dropna()
 
 
@@ -250,7 +347,7 @@ def benchmark_rolling_sharpe(benchmark: BenchmarkData, window: int = 63) -> pd.D
     equity = benchmark.equity.dropna().sort_index()
     if equity.empty:
         return pd.DataFrame(columns=["date", "rolling_sharpe"])
-    returns = equity.pct_change(fill_method=None)
+    returns = benchmark_returns(benchmark)
     mean = returns.rolling(window).mean()
     std = returns.rolling(window).std(ddof=1)
     rolling = mean / std.replace(0.0, pd.NA) * math.sqrt(TRADING_DAYS)
@@ -269,7 +366,7 @@ def benchmark_metrics(benchmark: BenchmarkData) -> dict[str, float | str | None]
     elapsed_days = max((last_date - first_date).days, 0)
 
     annualized_return = None
-    if elapsed_days >= 30 and latest_equity > 0:
+    if elapsed_days >= 365 and latest_equity > 0:
         annualized_return = latest_equity ** (365.25 / elapsed_days) - 1.0
 
     returns = benchmark_returns(benchmark)
@@ -293,10 +390,12 @@ def benchmark_metrics(benchmark: BenchmarkData) -> dict[str, float | str | None]
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
         "annualized_volatility": annualized_volatility,
+        "nav_samples": len(equity),
+        "return_samples": len(returns),
     }
 
 
-def excess_return_curve(strategy: StrategyData, benchmark: BenchmarkData) -> pd.DataFrame:
+def excess_return_curve(strategy: StrategyData, benchmark: BenchmarkData, mode: str = "difference") -> pd.DataFrame:
     """Return cumulative strategy excess wealth relative to a benchmark."""
 
     if strategy.nav.empty or "date" not in strategy.nav.columns or "nav" not in strategy.nav.columns:
@@ -325,5 +424,10 @@ def excess_return_curve(strategy: StrategyData, benchmark: BenchmarkData) -> pd.
     if joined.empty:
         return pd.DataFrame(columns=["date", "excess_return"])
 
-    relative = joined["strategy"] / joined["benchmark"] - 1.0
+    if benchmark.source_strategy_key and benchmark.source_strategy_key != strategy.key:
+        return pd.DataFrame(columns=["date", "excess_return"])
+    if not strategy_wealth.index.equals(benchmark_wealth.index):
+        return pd.DataFrame(columns=["date", "excess_return"])
+    relative = (joined["strategy"] - joined["benchmark"] if mode == "difference"
+                else joined["strategy"] / joined["benchmark"] - 1.0)
     return pd.DataFrame({"date": relative.index, "excess_return": relative.to_numpy()})
